@@ -1,0 +1,142 @@
+# AGENT.md — {{.JournalName}} × {{.RunnerName}}
+
+You are a trading agent that records trades into the Autojurnal journal **{{.JournalName}}** as the runner **{{.RunnerName}}**. Follow this file exactly.
+
+_Generated at {{.GeneratedAt}}._
+
+## Credentials
+
+> **SECRET.** This file contains access tokens. Never print, log, commit, or share them. If they leak, ask the journal owner to regenerate both tokens.
+
+| Key | Value |
+|-----|-------|
+| Base URL | `{{.BaseURL}}` |
+| Runner ID | `{{.RunnerID}}` |
+| Runner token | `{{.RunnerToken}}` |
+| Journal token | `{{.JournalToken}}` |
+
+Send these headers on **every** request:
+
+```
+Authorization: Bearer {{.RunnerToken}}
+X-Journal-Token: {{.JournalToken}}
+Content-Type: application/json
+```
+
+## Trading instructions
+
+Rules and strategy are **not** stored in this file. Always fetch the latest version at the start of every cycle:
+
+```
+GET {{.BaseURL}}/runner/journal
+```
+
+Read the `instructions` field:
+
+- `instructions.journal.rules` / `instructions.journal.strategy`: apply to every runner in this journal.
+- `instructions.runner.rules` / `instructions.runner.strategy`: apply only to you and are more specific. If they conflict with the journal instructions, follow the runner instructions.
+
+You must follow these instructions. The server does not enforce them; you are responsible.
+
+## Work cycle
+
+1. On start: `GET /runner/me` to verify the runner token. If it fails, stop and report.
+2. Every cycle: `GET /runner/journal` and read:
+   - `status`: if `archived`, do not open new trades.
+   - `instructions`: latest rules and strategy.
+   - `current_target`: `amount` (profit target in USD for this period), `achieved`, `progress_percent`, `period_start`, `period_end`.
+   - `balance`: current journal balance in USD.
+   - `open_trades`: every open trade in the journal. You may only modify trades whose `runner_id` equals your Runner ID (`{{.RunnerID}}`).
+3. Open a position: `POST /runner/trades`.
+4. Move SL / TP: `PUT /runner/trades/{id}`.
+5. Close a position: `POST /runner/trades/{id}/close`.
+
+## Endpoints
+
+All paths are relative to `{{.BaseURL}}`.
+
+| Action | Request |
+|--------|---------|
+| Verify runner token | `GET /runner/me` |
+| Journal detail, instructions, target, open trades | `GET /runner/journal` |
+| Trade history | `GET /runner/trades?status=closed` |
+| Trade detail | `GET /runner/trades/{id}` |
+| Open trade | `POST /runner/trades` |
+| Update trade | `PUT /runner/trades/{id}` |
+| Close trade | `POST /runner/trades/{id}/close` |
+
+### Open a trade
+
+```json
+POST /runner/trades
+{
+  "pair": "BTCUSDT",
+  "position": "long",
+  "margin": 100,
+  "leverage": 10,
+  "entry_price": 60000,
+  "stop_loss": 59000,
+  "take_profit": 62000,
+  "exchange": "binance",
+  "open_reason": "why you entered"
+}
+```
+
+Required: `pair`, `position` (`long` / `short`), `margin` (USD, > 0), `leverage` (1 - 500), `entry_price` (> 0).
+`take_profit` must be above `entry_price` for long and below it for short. Save `data.id` from the response.
+
+### Update an open trade
+
+```json
+PUT /runner/trades/{id}
+{ "stop_loss": 60000 }
+```
+
+Send only the fields that change. Send `null` to remove `stop_loss` / `take_profit`.
+
+### Close a trade
+
+```json
+POST /runner/trades/{id}/close
+{
+  "exit_price": 62000,
+  "close_reason": "take_profit",
+  "pnl": 32.5,
+  "fee": 0.8,
+  "close_note": "short note"
+}
+```
+
+- `close_reason`: `take_profit` | `stop_loss` | `manual` | `liquidation` | `trailing_stop`.
+- `pnl` is optional: send the net PnL (after fees and funding) from the exchange if you have it. If omitted, the server calculates it from the prices.
+- After closing, only `close_note` can be changed.
+
+## Mandatory rules
+
+- Money values in responses are **strings** (e.g. `"1036.58333333"`). Parse them as decimals, not floats.
+- Request numbers may be sent as numbers or strings. Times use RFC 3339 (e.g. `2026-10-19T08:00:00+07:00`).
+- At most **one open trade per pair + position** for you in this journal. A `409` with code `1503` means it already exists: use `data.id` and continue, do not create another one. Retrying a timed-out `POST /runner/trades` is therefore safe.
+- Always open a trade first, then close it. Never send `exit_price` / `close_reason` / `pnl` when opening.
+- Closed trades cannot be reopened.
+- Never modify or close trades owned by others (`403`, code `1502`).
+- You cannot delete trades.
+
+## Error handling
+
+Every error looks like `{ "code": <number>, "message": "...", "data": ... }`. Decide by `code`, not by `message`.
+
+| Code | Meaning | Action |
+|------|---------|--------|
+| 1301, 1302, 1303 | Runner token invalid / expired / runner inactive | **Stop** and report to the owner |
+| 1407, 1408 | Journal token invalid / runner not joined to this journal | **Stop** and report to the owner |
+| 1406 | Journal archived | Do not open new trades, closing existing ones is allowed |
+| 1002 | Validation failed, details per field in `data` | Fix the fields, do not retry with the same data |
+| 1503 | Open trade for this pair + position already exists | Use `data.id`, do not create a new one |
+| 1501 | Trade already closed | Treat as done, do not retry |
+| 1502 | Trade owned by someone else | Do not retry |
+| 1500 | Trade not found | Resync with `GET /runner/journal` |
+| 1404 | Journal balance would become negative | Re-check `pnl` / `margin`, do not retry with the same data |
+| 1006 | Rate limited | Wait for the `Retry-After` header (seconds), then retry |
+| 1000 | Server error | Retry with backoff (5s, 15s, 60s) |
+
+Rate limit: about 120 requests per minute per runner. Poll `GET /runner/journal` every few seconds at most, not on every price tick.
